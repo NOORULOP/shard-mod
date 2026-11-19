@@ -1,0 +1,1408 @@
+name: build
+
+# Builds the whole mod from the files written below. No other files needed.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.5.1
+      - name: Write mod files
+        run: |
+          :
+          cat > settings.gradle <<'SFEOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          rootProject.name = 'shardfusion'
+          SFEOF
+          :
+          cat > gradle.properties <<'SFEOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          # Minecraft 26.2 (unobfuscated: no mappings needed)
+          minecraft_version=26.2
+          loader_version=0.19.3
+          loom_version=1.17-SNAPSHOT
+
+          # Fabric API for 26.2 (any newer 26.2 build also works)
+          fabric_api_version=0.152.2+26.2
+
+          mod_version=1.0.0
+          maven_group=com.shardfusion
+          archives_base_name=shardfusion
+          SFEOF
+          :
+          cat > build.gradle <<'SFEOF'
+          plugins {
+              // Minecraft 26.1+ is unobfuscated, so the non-remapping Loom plugin is used.
+              id 'net.fabricmc.fabric-loom' version "${loom_version}"
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 25
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          SFEOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'SFEOF'
+          {
+            "schemaVersion": 1,
+            "id": "shardfusion",
+            "version": "${version}",
+            "name": "Shard Fusion Profit",
+            "description": "In-game black menu that shows Hypixel SkyBlock shard Bazaar prices and the profit of every shard fusion. Client-side only.",
+            "authors": [],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": [
+                "com.shardfusion.ShardFusionClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.3",
+              "minecraft": ">=26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          SFEOF
+          mkdir -p src/main/resources/assets/shardfusion/lang
+          cat > src/main/resources/assets/shardfusion/lang/en_us.json <<'SFEOF'
+          {
+            "key.shardfusion.open": "Open Shard Fusion menu",
+            "key.category.shardfusion.main": "Shard Fusion Profit"
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion
+          cat > src/main/java/com/shardfusion/ShardFusionClient.java <<'SFEOF'
+          package com.shardfusion;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import com.shardfusion.core.Settings;
+          import com.shardfusion.core.Store;
+          import com.shardfusion.ui.FusionScreen;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.resources.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.nio.file.Path;
+
+          /**
+           * Open the menu with the key (default K) or the chat commands /shards and /shardfusion.
+           * Commands only set a flag; the screen opens on the next tick, because the chat
+           * screen closes itself right after a command and would otherwise close ours.
+           */
+          public final class ShardFusionClient implements ClientModInitializer {
+              public static final String MOD_ID = "shardfusion";
+
+              private static volatile boolean openRequested;
+
+              @Override
+              public void onInitializeClient() {
+                  Path config = FabricLoader.getInstance().getConfigDir();
+                  Path settingsFile = config.resolve("shardfusion.properties");
+
+                  Settings settings = new Settings();
+                  settings.load(settingsFile);
+
+                  Store store = new Store(config.resolve("shardfusion"), settings);
+                  store.start(); // loads recipes in the background so the first open is fast
+
+                  KeyMapping.Category category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "main"));
+                  KeyMapping openKey = KeyMappingHelper.registerKeyMapping(
+                          new KeyMapping("key." + MOD_ID + ".open", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, category));
+
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
+                      dispatcher.register(ClientCommands.literal("shards").executes(ctx -> {
+                          openRequested = true;
+                          return 1;
+                      }));
+                      dispatcher.register(ClientCommands.literal("shardfusion").executes(ctx -> {
+                          openRequested = true;
+                          return 1;
+                      }));
+                  });
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (openKey.consumeClick()) openRequested = true;
+                      if (openRequested) {
+                          openRequested = false;
+                          client.gui.setScreen(new FusionScreen(store, settings, () -> settings.save(settingsFile)));
+                      }
+                  });
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/BazaarParser.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import com.google.gson.stream.JsonReader;
+          import com.google.gson.stream.JsonToken;
+
+          import java.io.BufferedReader;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+
+          /**
+           * Streams the Hypixel Bazaar response and keeps only SHARD_* products and only
+           * their quick_status numbers. Everything else is skipped without allocating,
+           * so a 10+ MB response costs very little memory.
+           */
+          public final class BazaarParser {
+              private BazaarParser() {
+              }
+
+              public static Prices parse(InputStream in, FusionData d, long now) throws IOException {
+                  int n = d.shards();
+                  double[] buy = new double[n], sell = new double[n], buyVol = new double[n], sellVol = new double[n];
+                  boolean success = false;
+                  int matched = 0;
+                  try (JsonReader r = new JsonReader(new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8), 1 << 16))) {
+                      r.beginObject();
+                      while (r.hasNext()) {
+                          String k = r.nextName();
+                          if (k.equals("success") && r.peek() == JsonToken.BOOLEAN) {
+                              success = r.nextBoolean();
+                          } else if (k.equals("products") && r.peek() == JsonToken.BEGIN_OBJECT) {
+                              r.beginObject();
+                              while (r.hasNext()) {
+                                  String pid = r.nextName();
+                                  Integer i = pid.startsWith("SHARD_") ? d.byBazaar.get(pid) : null;
+                                  if (i == null || r.peek() != JsonToken.BEGIN_OBJECT) {
+                                      r.skipValue();
+                                      continue;
+                                  }
+                                  if (readProduct(r, i, buy, sell, buyVol, sellVol)) matched++;
+                              }
+                              r.endObject();
+                          } else {
+                              r.skipValue();
+                          }
+                      }
+                      r.endObject();
+                  }
+                  if (!success) throw new IOException("Hypixel API said success=false");
+                  if (matched == 0) throw new IOException("No shard products found in Bazaar response");
+                  return new Prices(d, now, matched, buy, sell, buyVol, sellVol);
+              }
+
+              private static boolean readProduct(JsonReader r, int i, double[] buy, double[] sell,
+                                                 double[] buyVol, double[] sellVol) throws IOException {
+                  boolean got = false;
+                  r.beginObject();
+                  while (r.hasNext()) {
+                      String k = r.nextName();
+                      if (k.equals("quick_status") && r.peek() == JsonToken.BEGIN_OBJECT) {
+                          got = true;
+                          r.beginObject();
+                          while (r.hasNext()) {
+                              switch (r.nextName()) {
+                                  case "buyPrice" -> buy[i] = num(r);
+                                  case "sellPrice" -> sell[i] = num(r);
+                                  case "buyMovingWeek" -> buyVol[i] = num(r);
+                                  case "sellMovingWeek" -> sellVol[i] = num(r);
+                                  default -> r.skipValue();
+                              }
+                          }
+                          r.endObject();
+                      } else {
+                          r.skipValue();
+                      }
+                  }
+                  r.endObject();
+                  return got;
+              }
+
+              private static double num(JsonReader r) throws IOException {
+                  JsonToken t = r.peek();
+                  if (t == JsonToken.NUMBER || t == JsonToken.STRING) return r.nextDouble();
+                  r.skipValue();
+                  return 0;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Calc.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import java.util.Arrays;
+
+          /**
+           * Profit math. One pass over the recipe arrays (no allocation per recipe),
+           * keeping the most profitable recipe for every output shard.
+           *
+           * cost    = fuse(A) * priceA + fuse(B) * priceB
+           * revenue = outputCount * outputPrice * (1 - tax)
+           * profit  = revenue - cost
+           */
+          public final class Calc {
+              private Calc() {
+              }
+
+              public static final int MAX_FUSION_ROWS = 150;
+
+              private static final int WHITE = 0xFFFFFFFF;
+              private static final int[] RARITY_COLORS = {
+                      0xFFFFFFFF, // common
+                      0xFF55FF55, // uncommon
+                      0xFF6C8CFF, // rare
+                      0xFFD17BFF, // epic
+                      0xFFFFAA00, // legendary
+                      0xFFAAAAAA  // unknown
+              };
+              private static final int GREEN = 0xFF55FF55, RED = 0xFFFF5555, GRAY = 0xFF9AA0A6, LIGHT = 0xFFD0D0D0;
+
+              public static int rarityColor(FusionData d, int i) {
+                  return RARITY_COLORS[d.rarity[i]];
+              }
+
+              public static Result compute(FusionData d, Prices p, boolean buyInstant, boolean sellInstant,
+                                           double taxPct, int minVol) {
+                  int n = d.shards();
+                  double keep = 1.0 - taxPct / 100.0;
+                  double[] in = new double[n], rev1 = new double[n], vol = new double[n];
+                  for (int i = 0; i < n; i++) {
+                      double bp = buyInstant ? p.buy[i] : p.sell[i];
+                      in[i] = bp > 0 ? bp : 0;
+                      double sp = sellInstant ? p.sell[i] : p.buy[i];
+                      rev1[i] = sp > 0 ? sp * keep : 0;
+                      vol[i] = sellInstant ? p.sellVol[i] : p.buyVol[i];
+                  }
+
+                  double[] best = new double[n];
+                  int[] bestR = new int[n];
+                  Arrays.fill(best, Double.NEGATIVE_INFINITY);
+                  Arrays.fill(bestR, -1);
+
+                  int[] outIdx = d.outIdx, count = d.count, inA = d.inA, inB = d.inB, fuse = d.fuse;
+                  for (int r = 0, m = outIdx.length; r < m; r++) {
+                      int o = outIdx[r];
+                      double ro = rev1[o];
+                      if (ro <= 0) continue;
+                      int a = inA[r], b = inB[r];
+                      double pa = in[a], pb = in[b];
+                      if (pa <= 0 || pb <= 0) continue;
+                      double profit = count[r] * ro - (fuse[a] * pa + fuse[b] * pb);
+                      if (profit > best[o]) {
+                          best[o] = profit;
+                          bestR[o] = r;
+                      }
+                  }
+
+                  // collect + sort outputs by profit (at most ~200 shards)
+                  int[] order = new int[n];
+                  int k = 0;
+                  for (int o = 0; o < n; o++) {
+                      if (bestR[o] >= 0 && vol[o] >= minVol) order[k++] = o;
+                  }
+                  Integer[] boxed = new Integer[k];
+                  for (int i = 0; i < k; i++) boxed[i] = order[i];
+                  Arrays.sort(boxed, (x, y) -> Double.compare(best[y], best[x]));
+
+                  int rows = Math.min(k, MAX_FUSION_ROWS);
+                  Row[] fusions = new Row[rows];
+                  for (int i = 0; i < rows; i++) {
+                      int o = boxed[i];
+                      int r = bestR[o];
+                      int a = inA[r], b = inB[r], c = count[r];
+                      double cost = fuse[a] * in[a] + fuse[b] * in[b];
+                      double revenue = c * rev1[o];
+                      double profit = best[o];
+                      int pc = profit >= 0 ? GREEN : RED;
+                      String title = d.name[o] + " x" + c;
+                      fusions[i] = new Row(
+                              new String[]{title, fuse[a] + "x " + d.name[a], fuse[b] + "x " + d.name[b],
+                                      Fmt.compact(cost), Fmt.compact(revenue), Fmt.signed(profit), Fmt.compact(vol[o])},
+                              new int[]{rarityColor(d, o), rarityColor(d, a), rarityColor(d, b), LIGHT, LIGHT, pc, GRAY},
+                              title, Fmt.signed(profit) + " coins", rarityColor(d, o), pc);
+                  }
+
+                  // prices table (all shards that have a price), most expensive first
+                  int pk = 0;
+                  int[] porder = new int[n];
+                  for (int i = 0; i < n; i++) {
+                      if (p.buy[i] > 0 || p.sell[i] > 0) porder[pk++] = i;
+                  }
+                  Integer[] pboxed = new Integer[pk];
+                  for (int i = 0; i < pk; i++) pboxed[i] = porder[i];
+                  Arrays.sort(pboxed, (x, y) -> Double.compare(p.buy[y], p.buy[x]));
+                  Row[] prices = new Row[pk];
+                  for (int i = 0; i < pk; i++) {
+                      int s = pboxed[i];
+                      prices[i] = new Row(
+                              new String[]{d.name[s], FusionData.RARITY_NAMES[d.rarity[s]],
+                                      Fmt.compact(p.buy[s]), Fmt.compact(p.sell[s]),
+                                      Fmt.compact(p.sellVol[s]), Fmt.compact(p.buyVol[s])},
+                              new int[]{rarityColor(d, s), rarityColor(d, s), WHITE, WHITE, GRAY, GRAY},
+                              d.name[s], Fmt.compact(p.buy[s]), rarityColor(d, s), WHITE);
+                  }
+                  return new Result(fusions, prices, p.fetchedAt, d.recipes());
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Fmt.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import java.util.Locale;
+
+          /** Number formatting. Only used when rows are built, never per frame. */
+          public final class Fmt {
+              private Fmt() {
+              }
+
+              public static String compact(double v) {
+                  if (Double.isNaN(v) || Double.isInfinite(v)) return "-";
+                  double a = Math.abs(v);
+                  String s;
+                  if (a < 1000) s = trim(a, 1);
+                  else if (a < 1e6) s = trim(a / 1e3, 2) + "k";
+                  else if (a < 1e9) s = trim(a / 1e6, 2) + "M";
+                  else s = trim(a / 1e9, 2) + "B";
+                  return v < 0 ? "-" + s : s;
+              }
+
+              public static String signed(double v) {
+                  String s = compact(v);
+                  return v >= 0 ? "+" + s : s;
+              }
+
+              private static String trim(double x, int decimals) {
+                  String t = String.format(Locale.ROOT, "%." + decimals + "f", x);
+                  if (t.indexOf('.') >= 0) {
+                      int end = t.length();
+                      while (end > 0 && t.charAt(end - 1) == '0') end--;
+                      if (end > 0 && t.charAt(end - 1) == '.') end--;
+                      t = t.substring(0, end);
+                  }
+                  return t;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/FusionData.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import java.util.Map;
+
+          /**
+           * Immutable, array-based fusion catalog. Kept compact on purpose: there are
+           * ~135k possible recipes and this must stay light on a phone.
+           */
+          public final class FusionData {
+              public static final String[] RARITY_NAMES = {"Common", "Uncommon", "Rare", "Epic", "Legendary", "?"};
+
+              /** Short code such as "C1", "U12". */
+              public final String[] code;
+              public final String[] name;
+              /** Bazaar product id such as "SHARD_GROVE" (null if unknown). */
+              public final String[] bazaarId;
+              /** How many of this shard a fusion consumes. */
+              public final int[] fuse;
+              /** 0 common .. 4 legendary, 5 unknown. */
+              public final int[] rarity;
+
+              /** Recipe table (parallel arrays): output shard, output count, input A, input B. */
+              public final int[] outIdx, count, inA, inB;
+
+              public final Map<String, Integer> byBazaar;
+
+              FusionData(String[] code, String[] name, String[] bazaarId, int[] fuse, int[] rarity,
+                         int[] outIdx, int[] count, int[] inA, int[] inB, Map<String, Integer> byBazaar) {
+                  this.code = code;
+                  this.name = name;
+                  this.bazaarId = bazaarId;
+                  this.fuse = fuse;
+                  this.rarity = rarity;
+                  this.outIdx = outIdx;
+                  this.count = count;
+                  this.inA = inA;
+                  this.inB = inB;
+                  this.byBazaar = byBazaar;
+              }
+
+              public int shards() {
+                  return code.length;
+              }
+
+              public int recipes() {
+                  return outIdx.length;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/FusionLoader.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import com.google.gson.stream.JsonReader;
+          import com.google.gson.stream.JsonToken;
+
+          import java.io.BufferedReader;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.Locale;
+
+          /**
+           * Streams SkyShards' fusion-data.json into compact arrays (no big JSON tree).
+           *
+           * Format (from the SkyShards-Parser project):
+           *   "recipes": { "<outputCode>": { "<count>": [ ["<inA>", "<inB>"], ... ], ... }, ... }
+           *   "shards":  { "<code>": { "name", "rarity", "fuse_amount", "internal_id", ... }, ... }
+           * The "recipes" block comes before "shards", so codes are mapped to indexes on first sight.
+           */
+          public final class FusionLoader {
+              private FusionLoader() {
+              }
+
+              private static final class Sh {
+                  String name, internal, rarity;
+                  int fuse = 5;
+                  boolean seen;
+              }
+
+              private static final class B {
+                  final HashMap<String, Integer> idx = new HashMap<>(1024);
+                  final ArrayList<String> codes = new ArrayList<>();
+                  final ArrayList<Sh> shs = new ArrayList<>();
+                  final IntList out = new IntList(), cnt = new IntList(), a = new IntList(), b = new IntList();
+
+                  int id(String c) {
+                      Integer i = idx.get(c);
+                      if (i == null) {
+                          i = codes.size();
+                          idx.put(c, i);
+                          codes.add(c);
+                          shs.add(new Sh());
+                      }
+                      return i;
+                  }
+              }
+
+              public static FusionData parse(InputStream in) throws IOException {
+                  B b = new B();
+                  try (JsonReader r = new JsonReader(new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8), 1 << 16))) {
+                      r.beginObject();
+                      while (r.hasNext()) {
+                          String k = r.nextName();
+                          if (k.equals("recipes") && r.peek() == JsonToken.BEGIN_OBJECT) readRecipes(r, b);
+                          else if (k.equals("shards") && r.peek() == JsonToken.BEGIN_OBJECT) readShards(r, b);
+                          else r.skipValue();
+                      }
+                      r.endObject();
+                  }
+                  return build(b);
+              }
+
+              private static void readRecipes(JsonReader r, B b) throws IOException {
+                  r.beginObject();
+                  while (r.hasNext()) {
+                      int o = b.id(r.nextName());
+                      if (r.peek() != JsonToken.BEGIN_OBJECT) {
+                          r.skipValue();
+                          continue;
+                      }
+                      r.beginObject();
+                      while (r.hasNext()) {
+                          String key = r.nextName();
+                          int c;
+                          try {
+                              c = Integer.parseInt(key);
+                          } catch (NumberFormatException e) {
+                              c = -1;
+                          }
+                          if (c < 0 || r.peek() != JsonToken.BEGIN_ARRAY) {
+                              r.skipValue();
+                              continue;
+                          }
+                          r.beginArray();
+                          while (r.hasNext()) {
+                              if (r.peek() != JsonToken.BEGIN_ARRAY) {
+                                  r.skipValue();
+                                  continue;
+                              }
+                              r.beginArray();
+                              String x = null, y = null;
+                              int n = 0;
+                              while (r.hasNext()) {
+                                  String s = r.nextString();
+                                  if (n == 0) x = s;
+                                  else if (n == 1) y = s;
+                                  n++;
+                              }
+                              r.endArray();
+                              if (n >= 2) {
+                                  b.out.add(o);
+                                  b.cnt.add(c);
+                                  b.a.add(b.id(x));
+                                  b.b.add(b.id(y));
+                              }
+                          }
+                          r.endArray();
+                      }
+                      r.endObject();
+                  }
+                  r.endObject();
+              }
+
+              private static void readShards(JsonReader r, B b) throws IOException {
+                  r.beginObject();
+                  while (r.hasNext()) {
+                      Sh s = b.shs.get(b.id(r.nextName()));
+                      if (r.peek() != JsonToken.BEGIN_OBJECT) {
+                          r.skipValue();
+                          continue;
+                      }
+                      s.seen = true;
+                      r.beginObject();
+                      while (r.hasNext()) {
+                          String k = r.nextName();
+                          boolean isStr = r.peek() == JsonToken.STRING;
+                          switch (k) {
+                              case "name" -> {
+                                  if (isStr) s.name = r.nextString();
+                                  else r.skipValue();
+                              }
+                              case "internal_id" -> {
+                                  if (isStr) s.internal = r.nextString();
+                                  else r.skipValue();
+                              }
+                              case "rarity" -> {
+                                  if (isStr) s.rarity = r.nextString();
+                                  else r.skipValue();
+                              }
+                              case "fuse_amount" -> {
+                                  if (r.peek() == JsonToken.NUMBER) s.fuse = (int) r.nextDouble();
+                                  else r.skipValue();
+                              }
+                              default -> r.skipValue();
+                          }
+                      }
+                      r.endObject();
+                  }
+                  r.endObject();
+              }
+
+              private static int rarityOf(String rarity, String code) {
+                  if (rarity != null) {
+                      switch (rarity.toLowerCase(Locale.ROOT)) {
+                          case "common": return 0;
+                          case "uncommon": return 1;
+                          case "rare": return 2;
+                          case "epic": return 3;
+                          case "legendary": return 4;
+                          default: break;
+                      }
+                  }
+                  if (code != null && !code.isEmpty()) {
+                      switch (code.charAt(0)) {
+                          case 'C': return 0;
+                          case 'U': return 1;
+                          case 'R': return 2;
+                          case 'E': return 3;
+                          case 'L': return 4;
+                          default: break;
+                      }
+                  }
+                  return 5;
+              }
+
+              private static FusionData build(B b) throws IOException {
+                  int n = b.codes.size();
+                  int known = 0;
+                  for (Sh s : b.shs) if (s.seen) known++;
+                  if (b.out.n < 100 || known < 20) {
+                      throw new IOException("Unexpected fusion-data format (" + b.out.n + " recipes, " + known + " shards)");
+                  }
+                  String[] code = new String[n], name = new String[n], bz = new String[n];
+                  int[] fuse = new int[n], rar = new int[n];
+                  HashMap<String, Integer> by = new HashMap<>(n * 2);
+                  for (int i = 0; i < n; i++) {
+                      Sh s = b.shs.get(i);
+                      code[i] = b.codes.get(i);
+                      name[i] = s.name != null ? s.name : code[i];
+                      if (s.internal != null) bz[i] = s.internal;
+                      else if (s.name != null) bz[i] = "SHARD_" + s.name.toUpperCase(Locale.ROOT).replace(' ', '_');
+                      fuse[i] = s.fuse > 0 ? s.fuse : 5;
+                      rar[i] = rarityOf(s.rarity, code[i]);
+                      if (bz[i] != null) by.putIfAbsent(bz[i], i);
+                  }
+                  return new FusionData(code, name, bz, fuse, rar,
+                          b.out.toArray(), b.cnt.toArray(), b.a.toArray(), b.b.toArray(), by);
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/IntList.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import java.util.Arrays;
+
+          /** Tiny growable int array (avoids boxing ~135k recipe entries). */
+          final class IntList {
+              private int[] a = new int[4096];
+              int n;
+
+              void add(int v) {
+                  if (n == a.length) a = Arrays.copyOf(a, n * 2);
+                  a[n++] = v;
+              }
+
+              int[] toArray() {
+                  return Arrays.copyOf(a, n);
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Prices.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          /** One Bazaar snapshot, indexed by shard index of {@link #forData}. */
+          public final class Prices {
+              /** Price to instantly buy (lowest sell offers). */
+              public final double[] buy;
+              /** Price when instantly selling (highest buy orders). */
+              public final double[] sell;
+              /** Items bought via instant-buy in the last week. */
+              public final double[] buyVol;
+              /** Items sold via instant-sell in the last week. */
+              public final double[] sellVol;
+              public final long fetchedAt;
+              public final int matched;
+              public final FusionData forData;
+
+              Prices(FusionData d, long fetchedAt, int matched, double[] buy, double[] sell, double[] buyVol, double[] sellVol) {
+                  this.forData = d;
+                  this.fetchedAt = fetchedAt;
+                  this.matched = matched;
+                  this.buy = buy;
+                  this.sell = sell;
+                  this.buyVol = buyVol;
+                  this.sellVol = sellVol;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Result.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          /** Immutable computed snapshot that the screen reads. */
+          public final class Result {
+              public static final Row[] NONE = new Row[0];
+
+              public final Row[] fusions;
+              public final Row[] prices;
+              public final long fetchedAt;
+              public final int recipes;
+
+              Result(Row[] fusions, Row[] prices, long fetchedAt, int recipes) {
+                  this.fusions = fusions;
+                  this.prices = prices;
+                  this.fetchedAt = fetchedAt;
+                  this.recipes = recipes;
+              }
+
+              public Row best() {
+                  return fusions.length > 0 ? fusions[0] : null;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Row.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          /** One table row. All text is pre-formatted so rendering does no string work. */
+          public final class Row {
+              public final String[] cells;
+              public final int[] colors;
+              /** For the "best fusion" box. */
+              public final String title;
+              public final String profitText;
+              public final int titleColor;
+              public final int profitColor;
+
+              Row(String[] cells, int[] colors, String title, String profitText, int titleColor, int profitColor) {
+                  this.cells = cells;
+                  this.colors = colors;
+                  this.title = title;
+                  this.profitText = profitText;
+                  this.titleColor = titleColor;
+                  this.profitColor = profitColor;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Settings.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+
+          /** User options, saved to config/shardfusion.properties. */
+          public final class Settings {
+              public static final double[] TAXES = {1.25, 1.125, 1.0, 2.25};
+              public static final int[] MIN_VOLS = {0, 1000, 10000, 50000};
+
+              /** true = pay the instant-buy price for input shards; false = place buy orders. */
+              public volatile boolean buyInstant = true;
+              /** true = instant-sell the output; false = list it as a sell offer. */
+              public volatile boolean sellInstant = false;
+              public volatile int taxIdx = 0;
+              public volatile int volIdx = 0;
+              /** 0 = fusions table, 1 = prices table. */
+              public volatile int tab = 0;
+
+              public double tax() {
+                  return TAXES[taxIdx];
+              }
+
+              public int minVol() {
+                  return MIN_VOLS[volIdx];
+              }
+
+              public void load(Path file) {
+                  if (!Files.isRegularFile(file)) return;
+                  Properties p = new Properties();
+                  try (InputStream in = Files.newInputStream(file)) {
+                      p.load(in);
+                      buyInstant = Boolean.parseBoolean(p.getProperty("buyInstant", "true"));
+                      sellInstant = Boolean.parseBoolean(p.getProperty("sellInstant", "false"));
+                      taxIdx = clamp(p.getProperty("taxIdx"), TAXES.length);
+                      volIdx = clamp(p.getProperty("volIdx"), MIN_VOLS.length);
+                      tab = clamp(p.getProperty("tab"), 2);
+                  } catch (IOException | RuntimeException ignored) {
+                  }
+              }
+
+              public void save(Path file) {
+                  Properties p = new Properties();
+                  p.setProperty("buyInstant", Boolean.toString(buyInstant));
+                  p.setProperty("sellInstant", Boolean.toString(sellInstant));
+                  p.setProperty("taxIdx", Integer.toString(taxIdx));
+                  p.setProperty("volIdx", Integer.toString(volIdx));
+                  p.setProperty("tab", Integer.toString(tab));
+                  try (OutputStream out = Files.newOutputStream(file)) {
+                      p.store(out, "Shard Fusion Profit settings");
+                  } catch (IOException ignored) {
+                  }
+              }
+
+              private static int clamp(String s, int len) {
+                  try {
+                      int v = Integer.parseInt(s.trim());
+                      return v < 0 || v >= len ? 0 : v;
+                  } catch (RuntimeException e) {
+                      return 0;
+                  }
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/core
+          cat > src/main/java/com/shardfusion/core/Store.java <<'SFEOF'
+          package com.shardfusion.core;
+
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.net.URI;
+          import java.net.http.HttpClient;
+          import java.net.http.HttpRequest;
+          import java.net.http.HttpResponse;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.nio.file.StandardCopyOption;
+          import java.time.Duration;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.zip.GZIPInputStream;
+
+          /**
+           * Owns all slow work (downloads, parsing, math) on ONE low-priority background
+           * thread. The screen only reads the volatile {@link #result()} snapshot, so
+           * opening or scrolling the menu never blocks the render thread.
+           */
+          public final class Store {
+              private static final String BAZAAR_URL = "https://api.hypixel.net/v2/skyblock/bazaar";
+              private static final String[] FUSION_URLS = {
+                      "https://raw.githubusercontent.com/Campionnn/SkyShards/master/public/fusion-data.json",
+                      "https://cdn.jsdelivr.net/gh/Campionnn/SkyShards@master/public/fusion-data.json"
+              };
+              private static final String BUNDLED = "/shardfusion/fusion-data.json";
+              private static final long RECIPE_MAX_AGE_MS = 24L * 3600 * 1000;
+              private static final long AUTO_REFRESH_MS = 50_000;
+              private static final long RETRY_MS = 30_000;
+
+              private final Path dir;
+              private final Settings settings;
+              private final HttpClient http;
+              private final ExecutorService ex;
+
+              private volatile FusionData data;
+              private volatile Prices prices;
+              private volatile Result result;
+              private volatile String status = "Starting...";
+              private volatile boolean busy;
+              private volatile long nextAllowed;
+              private volatile long lastAttempt;
+
+              public Store(Path dir, Settings settings) {
+                  this.dir = dir;
+                  this.settings = settings;
+                  this.http = HttpClient.newBuilder()
+                          .connectTimeout(Duration.ofSeconds(10))
+                          .followRedirects(HttpClient.Redirect.NORMAL)
+                          .build();
+                  this.ex = Executors.newSingleThreadExecutor(r -> {
+                      Thread t = new Thread(r, "ShardFusion-worker");
+                      t.setDaemon(true);
+                      t.setPriority(Thread.NORM_PRIORITY - 1);
+                      return t;
+                  });
+              }
+
+              // ---- read-only state for the UI ----
+              public Result result() {
+                  return result;
+              }
+
+              public String status() {
+                  return status;
+              }
+
+              public boolean busy() {
+                  return busy;
+              }
+
+              // ---- actions ----
+              /** Load recipes in the background (call once at startup). */
+              public void start() {
+                  ex.execute(this::loadData);
+              }
+
+              /** Fetch fresh Bazaar prices if allowed. Cheap to call every frame. */
+              public void refresh(boolean force) {
+                  long now = System.currentTimeMillis();
+                  if (busy) return;
+                  if (force ? now - lastAttempt < 5_000 : now < nextAllowed) return;
+                  busy = true;
+                  lastAttempt = now;
+                  ex.execute(() -> {
+                      try {
+                          doFetch();
+                      } finally {
+                          busy = false;
+                      }
+                  });
+              }
+
+              /** Re-run the profit math after the user changed an option. */
+              public void recompute() {
+                  ex.execute(this::doCompute);
+              }
+
+              // ---- worker-thread code ----
+              private void loadData() {
+                  status = "Loading fusion recipes...";
+                  Path cache = dir.resolve("fusion-data.json");
+                  FusionData d = null;
+                  boolean cacheFresh = false;
+                  try {
+                      if (Files.isRegularFile(cache)) {
+                          try (InputStream in = Files.newInputStream(cache)) {
+                              d = FusionLoader.parse(in);
+                          }
+                          long age = System.currentTimeMillis() - Files.getLastModifiedTime(cache).toMillis();
+                          cacheFresh = age < RECIPE_MAX_AGE_MS;
+                      }
+                  } catch (Exception ignored) {
+                      d = null;
+                  }
+                  if (d == null) {
+                      try (InputStream in = Store.class.getResourceAsStream(BUNDLED)) {
+                          if (in != null) d = FusionLoader.parse(in);
+                      } catch (Exception ignored) {
+                          d = null;
+                      }
+                  }
+                  if (d != null) setData(d);
+
+                  if (!cacheFresh) {
+                      try {
+                          setData(downloadFusion(cache));
+                      } catch (Exception e) {
+                          if (d == null) status = "Could not load recipes: " + msg(e);
+                      }
+                  }
+                  if (data != null && status.startsWith("Loading")) status = "";
+              }
+
+              private void setData(FusionData d) {
+                  data = d;
+                  if (prices != null && prices.forData != d) prices = null;
+                  nextAllowed = 0;
+                  status = "";
+              }
+
+              private FusionData downloadFusion(Path cache) throws Exception {
+                  Exception last = null;
+                  Files.createDirectories(dir);
+                  Path tmp = dir.resolve("fusion-data.json.tmp");
+                  for (String url : FUSION_URLS) {
+                      try {
+                          HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                                  .timeout(Duration.ofSeconds(40))
+                                  .header("Accept-Encoding", "gzip")
+                                  .header("User-Agent", "ShardFusionMod/1.0")
+                                  .GET().build();
+                          HttpResponse<InputStream> resp = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
+                          if (resp.statusCode() != 200) {
+                              resp.body().close();
+                              throw new IOException("HTTP " + resp.statusCode());
+                          }
+                          try (InputStream in = decode(resp)) {
+                              Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+                          }
+                          if (Files.size(tmp) > 30_000_000L) throw new IOException("recipe file too large");
+                          FusionData d;
+                          try (InputStream in = Files.newInputStream(tmp)) {
+                              d = FusionLoader.parse(in);
+                          }
+                          Files.move(tmp, cache, StandardCopyOption.REPLACE_EXISTING);
+                          return d;
+                      } catch (Exception e) {
+                          last = e;
+                      }
+                  }
+                  throw last != null ? last : new IOException("no recipe source");
+              }
+
+              private void doFetch() {
+                  long now = System.currentTimeMillis();
+                  FusionData d = data;
+                  if (d == null) {
+                      loadData();
+                      d = data;
+                      if (d == null) {
+                          nextAllowed = now + 60_000;
+                          return;
+                      }
+                  }
+                  try {
+                      HttpRequest req = HttpRequest.newBuilder(URI.create(BAZAAR_URL))
+                              .timeout(Duration.ofSeconds(30))
+                              .header("Accept-Encoding", "gzip")
+                              .header("User-Agent", "ShardFusionMod/1.0")
+                              .GET().build();
+                      HttpResponse<InputStream> resp = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
+                      if (resp.statusCode() != 200) {
+                          resp.body().close();
+                          throw new IOException("Hypixel API HTTP " + resp.statusCode());
+                      }
+                      Prices p;
+                      try (InputStream in = decode(resp)) {
+                          p = BazaarParser.parse(in, d, System.currentTimeMillis());
+                      }
+                      prices = p;
+                      status = "";
+                      nextAllowed = System.currentTimeMillis() + AUTO_REFRESH_MS;
+                      doCompute();
+                  } catch (InterruptedException e) {
+                      Thread.currentThread().interrupt();
+                  } catch (Exception e) {
+                      status = "Fetch failed: " + msg(e) + " (will retry)";
+                      nextAllowed = System.currentTimeMillis() + RETRY_MS;
+                  }
+              }
+
+              private void doCompute() {
+                  FusionData d = data;
+                  Prices p = prices;
+                  if (d == null || p == null || p.forData != d) return;
+                  try {
+                      result = Calc.compute(d, p, settings.buyInstant, settings.sellInstant, settings.tax(), settings.minVol());
+                  } catch (RuntimeException e) {
+                      status = "Calculation error: " + msg(e);
+                  }
+              }
+
+              private static InputStream decode(HttpResponse<InputStream> r) throws IOException {
+                  InputStream body = r.body();
+                  String enc = r.headers().firstValue("content-encoding").orElse("");
+                  return enc.equalsIgnoreCase("gzip") ? new GZIPInputStream(body, 1 << 16) : body;
+              }
+
+              private static String msg(Throwable e) {
+                  String m = e.getMessage();
+                  String s = m == null || m.isBlank() ? e.getClass().getSimpleName() : m;
+                  return s.length() > 60 ? s.substring(0, 60) : s;
+              }
+          }
+          SFEOF
+          mkdir -p src/main/java/com/shardfusion/ui
+          cat > src/main/java/com/shardfusion/ui/FusionScreen.java <<'SFEOF'
+          package com.shardfusion.ui;
+
+          import com.shardfusion.core.Result;
+          import com.shardfusion.core.Row;
+          import com.shardfusion.core.Settings;
+          import com.shardfusion.core.Store;
+          import net.minecraft.client.gui.Font;
+          import net.minecraft.client.gui.GuiGraphicsExtractor;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /**
+           * Black centered menu (70% of the screen). Performance rules:
+           *  - no network / parsing / math here, only reads Store.result() (a ready snapshot)
+           *  - every row's text is pre-formatted, only ~12 rows are drawn per frame
+           *  - uses a plain dim instead of the blurred background
+           *  - Up/Down buttons exist because mouse-wheel scrolling is awkward on phones
+           */
+          public final class FusionScreen extends Screen {
+              /** How much of the screen the menu covers (0.70 = 70%). */
+              private static final double SCREEN_FRACTION = 0.70;
+
+              private static final String[] FUS_HEAD = {"Output", "Input A", "Input B", "Cost", "Revenue", "Profit", "Vol/wk"};
+              private static final int[] FUS_W = {21, 19, 19, 10, 11, 11, 9};
+              private static final String[] PRC_HEAD = {"Shard", "Rarity", "Insta-Buy", "Insta-Sell", "Sold/wk", "Bought/wk"};
+              private static final int[] PRC_W = {26, 12, 18, 18, 13, 13};
+
+              private static final int ROW_H = 11;
+              private static final int PAD = 6;
+              private static final int BTN_H = 20;
+
+              private static final int BORDER = 0xFFFFD24A;
+              private static final int TITLE = 0xFFFFD24A;
+              private static final int MUTED = 0xFF9AA0A6;
+
+              private final Store store;
+              private final Settings st;
+              private final Runnable save;
+
+              private int px, py, pw, ph;
+              private int tableX, tableW, headY, rowsY, visRows;
+              private int boxX, boxY, boxW;
+              private int[] fusX, fusCh, prcX, prcCh;
+              private int scroll;
+              private Button tabBtn, buyBtn, sellBtn, taxBtn, volBtn;
+
+              private long statusSec = -1;
+              private String statusText = "";
+
+              public FusionScreen(Store store, Settings st, Runnable save) {
+                  super(Component.literal("Shard Fusion Profit"));
+                  this.store = store;
+                  this.st = st;
+                  this.save = save;
+              }
+
+              @Override
+              protected void init() {
+                  pw = Math.max(200, Math.min(this.width - 8, (int) (this.width * SCREEN_FRACTION)));
+                  ph = Math.max(150, Math.min(this.height - 8, (int) (this.height * SCREEN_FRACTION)));
+                  px = (this.width - pw) / 2;
+                  py = (this.height - ph) / 2;
+
+                  // best-fusion box: top-right corner of the menu
+                  boxW = Math.min(190, (int) (pw * 0.42));
+                  boxX = px + pw - PAD - boxW;
+                  boxY = py + 5;
+
+                  // option buttons (wrap onto a second row on narrow screens)
+                  int gap = 4, n = 5;
+                  int perRow = Math.max(1, Math.min(n, (pw - 2 * PAD + gap) / (64 + gap)));
+                  int bw = (pw - 2 * PAD - (perRow - 1) * gap) / perRow;
+                  int btnTop = py + 5 + 36 + 4;
+                  tabBtn = opt(0, perRow, bw, gap, btnTop, tabLabel(), b -> {
+                      st.tab = st.tab == 0 ? 1 : 0;
+                      scroll = 0;
+                      b.setMessage(Component.literal(tabLabel()));
+                      changed(false);
+                  });
+                  buyBtn = opt(1, perRow, bw, gap, btnTop, buyLabel(), b -> {
+                      st.buyInstant = !st.buyInstant;
+                      b.setMessage(Component.literal(buyLabel()));
+                      changed(true);
+                  });
+                  sellBtn = opt(2, perRow, bw, gap, btnTop, sellLabel(), b -> {
+                      st.sellInstant = !st.sellInstant;
+                      b.setMessage(Component.literal(sellLabel()));
+                      changed(true);
+                  });
+                  taxBtn = opt(3, perRow, bw, gap, btnTop, taxLabel(), b -> {
+                      st.taxIdx = (st.taxIdx + 1) % Settings.TAXES.length;
+                      b.setMessage(Component.literal(taxLabel()));
+                      changed(true);
+                  });
+                  volBtn = opt(4, perRow, bw, gap, btnTop, volLabel(), b -> {
+                      st.volIdx = (st.volIdx + 1) % Settings.MIN_VOLS.length;
+                      scroll = 0;
+                      b.setMessage(Component.literal(volLabel()));
+                      changed(true);
+                  });
+                  int rowsOfButtons = (n + perRow - 1) / perRow;
+                  int buttonsBottom = btnTop + rowsOfButtons * (BTN_H + gap) - gap;
+
+                  // bottom bar: Up / Down / Refresh / Close
+                  int barY = py + ph - PAD - BTN_H;
+                  int bw2 = (pw - 2 * PAD - 3 * gap) / 4;
+                  String[] names = {"Up", "Down", "Refresh", "Close"};
+                  for (int i = 0; i < 4; i++) {
+                      final int which = i;
+                      addRenderableWidget(Button.builder(Component.literal(names[i]), b -> {
+                          int page = Math.max(1, visRows - 1);
+                          switch (which) {
+                              case 0 -> scroll -= page;
+                              case 1 -> scroll += page;
+                              case 2 -> store.refresh(true);
+                              default -> this.onClose();
+                          }
+                      }).bounds(px + PAD + i * (bw2 + gap), barY, bw2, BTN_H).build());
+                  }
+
+                  // table
+                  tableX = px + PAD;
+                  tableW = pw - 2 * PAD - 6;
+                  headY = buttonsBottom + 5;
+                  rowsY = headY + ROW_H + 3;
+                  int tableBottom = barY - 4;
+                  visRows = Math.max(1, (tableBottom - rowsY) / ROW_H);
+
+                  fusX = new int[FUS_W.length];
+                  fusCh = new int[FUS_W.length];
+                  prcX = new int[PRC_W.length];
+                  prcCh = new int[PRC_W.length];
+                  columns(FUS_W, fusX, fusCh);
+                  columns(PRC_W, prcX, prcCh);
+
+                  store.refresh(false);
+              }
+
+              private Button opt(int i, int perRow, int bw, int gap, int top, String label, Button.OnPress press) {
+                  int col = i % perRow, row = i / perRow;
+                  return addRenderableWidget(Button.builder(Component.literal(label), press)
+                          .bounds(px + PAD + col * (bw + gap), top + row * (BTN_H + gap), bw, BTN_H).build());
+              }
+
+              private void columns(int[] weights, int[] xs, int[] chars) {
+                  int total = 0;
+                  for (int w : weights) total += w;
+                  int x = tableX;
+                  for (int i = 0; i < weights.length; i++) {
+                      int w = tableW * weights[i] / total;
+                      xs[i] = x;
+                      chars[i] = Math.max(3, (w - 3) / 6);
+                      x += w;
+                  }
+              }
+
+              private void changed(boolean recompute) {
+                  save.run();
+                  if (recompute) store.recompute();
+              }
+
+              private String tabLabel() {
+                  return st.tab == 0 ? "View: Fusions" : "View: Prices";
+              }
+
+              private String buyLabel() {
+                  return st.buyInstant ? "Buy: Instant" : "Buy: Order";
+              }
+
+              private String sellLabel() {
+                  return st.sellInstant ? "Sell: Instant" : "Sell: Offer";
+              }
+
+              private String taxLabel() {
+                  return "Tax " + Settings.TAXES[st.taxIdx] + "%";
+              }
+
+              private String volLabel() {
+                  int v = st.minVol();
+                  return v == 0 ? "Min vol: off" : "Min vol: " + (v / 1000) + "k";
+              }
+
+              /** Mouse wheel (touch launchers rarely send it, hence the Up/Down buttons). */
+              public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+                  scroll += scrollY > 0 ? -3 : 3;
+                  return true;
+              }
+
+              /** Plain dim instead of the blurred vanilla background (cheaper on phones). */
+              public void extractBackground(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
+                  g.fill(0, 0, this.width, this.height, 0x88000000);
+              }
+
+              @Override
+              public void extractRenderState(GuiGraphicsExtractor g, int mx, int my, float delta) {
+                  store.refresh(false);
+
+                  // black panel first, so the buttons drawn by super.* sit on top of it
+                  g.fill(px, py, px + pw, py + ph, 0xFF000000);
+                  frame(g, px, py, pw, ph, BORDER);
+
+                  super.extractRenderState(g, mx, my, delta);
+
+                  Font f = this.minecraft.font;
+                  Result res = store.result();
+                  Row[] rows = res == null ? Result.NONE : (st.tab == 0 ? res.fusions : res.prices);
+
+                  // title + status (top-left)
+                  g.text(f, "Shard Fusion Profit", px + PAD, py + 7, TITLE, true);
+                  g.text(f, trunc(status(res), Math.max(8, (boxX - px - PAD - 6) / 6)), px + PAD, py + 20, MUTED, false);
+
+                  // best fusion (top-right corner)
+                  g.fill(boxX, boxY, boxX + boxW, boxY + 36, 0xFF101010);
+                  frame(g, boxX, boxY, boxW, 36, BORDER);
+                  int chars = Math.max(6, (boxW - 8) / 6);
+                  Row best = res == null ? null : res.best();
+                  if (best != null) {
+                      g.text(f, "BEST FUSION", boxX + 4, boxY + 4, MUTED, false);
+                      g.text(f, trunc(best.title, chars), boxX + 4, boxY + 14, best.titleColor, false);
+                      g.text(f, trunc(best.profitText, chars), boxX + 4, boxY + 24, best.profitColor, false);
+                  } else {
+                      g.text(f, "BEST FUSION", boxX + 4, boxY + 4, MUTED, false);
+                      g.text(f, "waiting for data", boxX + 4, boxY + 18, MUTED, false);
+                  }
+
+                  // table header
+                  boolean fus = st.tab == 0;
+                  String[] head = fus ? FUS_HEAD : PRC_HEAD;
+                  int[] xs = fus ? fusX : prcX, ch = fus ? fusCh : prcCh;
+                  g.fill(tableX - 2, headY - 1, tableX + tableW + 2, headY + ROW_H, 0xFF1E1E1E);
+                  for (int c = 0; c < head.length; c++) {
+                      g.text(f, trunc(head[c], ch[c]), xs[c], headY + 1, TITLE, false);
+                  }
+
+                  // rows
+                  int max = Math.max(0, rows.length - visRows);
+                  if (scroll > max) scroll = max;
+                  if (scroll < 0) scroll = 0;
+                  for (int i = 0; i < visRows; i++) {
+                      int idx = scroll + i;
+                      if (idx >= rows.length) break;
+                      int y = rowsY + i * ROW_H;
+                      boolean hover = mx >= tableX && mx < tableX + tableW && my >= y && my < y + ROW_H;
+                      if (hover) g.fill(tableX - 2, y, tableX + tableW + 2, y + ROW_H, 0x33FFFFFF);
+                      else if ((i & 1) == 1) g.fill(tableX - 2, y, tableX + tableW + 2, y + ROW_H, 0x14FFFFFF);
+                      Row row = rows[idx];
+                      for (int c = 0; c < row.cells.length; c++) {
+                          g.text(f, trunc(row.cells[c], ch[c]), xs[c], y + 1, row.colors[c], false);
+                      }
+                  }
+                  if (rows.length == 0) {
+                      String m = res == null ? "Waiting for Bazaar prices..." : "No fusions match your filters";
+                      g.text(f, m, tableX + 4, rowsY + 6, MUTED, false);
+                  }
+
+                  // scrollbar
+                  if (rows.length > visRows) {
+                      int trackH = visRows * ROW_H;
+                      int sx = px + pw - PAD - 3;
+                      g.fill(sx, rowsY, sx + 3, rowsY + trackH, 0xFF222222);
+                      int thumb = Math.max(8, trackH * visRows / rows.length);
+                      int ty = rowsY + (trackH - thumb) * scroll / Math.max(1, max);
+                      g.fill(sx, ty, sx + 3, ty + thumb, BORDER);
+                  }
+              }
+
+              private String status(Result res) {
+                  long sec = System.currentTimeMillis() / 1000;
+                  if (sec != statusSec) {
+                      statusSec = sec;
+                      StringBuilder sb = new StringBuilder();
+                      if (res != null) {
+                          long age = Math.max(0, System.currentTimeMillis() - res.fetchedAt) / 1000;
+                          sb.append("Prices updated ").append(age).append("s ago");
+                      } else {
+                          sb.append("No prices yet");
+                      }
+                      if (store.busy()) sb.append(" - refreshing...");
+                      String s = store.status();
+                      if (!s.isEmpty()) sb.append(" | ").append(s);
+                      statusText = sb.toString();
+                  }
+                  return statusText;
+              }
+
+              private static String trunc(String s, int max) {
+                  return s.length() <= max ? s : s.substring(0, Math.max(1, max - 1)) + ".";
+              }
+
+              private static void frame(GuiGraphicsExtractor g, int x, int y, int w, int h, int color) {
+                  g.fill(x, y, x + w, y + 1, color);
+                  g.fill(x, y + h - 1, x + w, y + h, color);
+                  g.fill(x, y, x + 1, y + h, color);
+                  g.fill(x + w - 1, y, x + w, y + h, color);
+              }
+          }
+          SFEOF
+      - name: Build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shardfusion-jar
+          path: build/libs/*.jar
